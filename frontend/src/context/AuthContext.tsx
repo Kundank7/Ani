@@ -1,0 +1,284 @@
+import React, { createContext, useContext, useEffect, useState } from 'react';
+import { type User, signInWithPopup, signOut, onAuthStateChanged, updateProfile } from 'firebase/auth';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { auth, googleProvider, db, isFirebaseEnabled } from '../services/firebase';
+import { getDeterministicAvatar } from '../utils/avatars';
+import { clearLegacyUnscopedProgressStorage, syncStorage } from '../utils/storage';
+import { DEFAULT_BANNER_URL, resolveStaticAssetUrl } from '../config/cloudinaryAssets';
+
+interface AuthContextType {
+    user: User | null;
+    avatar: string | null;
+    banner: string | null;
+    profileCardBackground: string | null;
+    isLoading: boolean;
+    login: () => Promise<void>;
+    logout: () => Promise<void>;
+    updateName: (name: string) => Promise<void>;
+    updateAvatar: (path: string) => Promise<void>;
+    updateBanner: (path: string) => Promise<void>;
+    updateProfileCardBackground: (path: string) => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+
+
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+    const [user, setUser] = useState<User | null>(null);
+    const [avatar, setAvatar] = useState<string | null>(null);
+    const [banner, setBanner] = useState<string | null>(null);
+    const [profileCardBackground, setProfileCardBackground] = useState<string | null>(null);
+    const [isLoading, setIsLoading] = useState(true);
+
+    const fetchUserProfile = async (uid: string) => {
+        if (!db) return { avatar: null, banner: null, profileCardBackground: null };
+        try {
+            const docRef = doc(db, 'users', uid);
+            const docSnap = await getDoc(docRef);
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                return {
+                    avatar: (data.avatar as string) || null,
+                    banner: (data.banner as string) || null,
+                    profileCardBackground: (data.profileCardBackground as string) || null
+                };
+            }
+        } catch (error) {
+            console.error('Failed to fetch user profile from Firestore:', error);
+        }
+        return { avatar: null, banner: null, profileCardBackground: null };
+    };
+
+    const saveUserProfile = async (uid: string, values: { avatar?: string; banner?: string; profileCardBackground?: string; displayName?: string; email?: string; searchName?: string; creationTime?: string }) => {
+        if (!db) return;
+        try {
+            const docRef = doc(db, 'users', uid);
+            await setDoc(docRef, values, { merge: true });
+        } catch (error) {
+            console.error('Failed to save user profile to Firestore:', error);
+        }
+    };
+
+    useEffect(() => {
+        if (!isFirebaseEnabled || !auth) {
+            setUser(null);
+            setAvatar(null);
+            setBanner(null);
+            setProfileCardBackground(null);
+            setIsLoading(false);
+            return () => undefined;
+        }
+
+        const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+            setUser(currentUser);
+
+            if (currentUser) {
+                // Only clear legacy unscoped keys. Scoped user data should survive refresh/sign-in.
+                clearLegacyUnscopedProgressStorage();
+
+                // Sync data from cloud
+                try {
+                    await syncStorage.pullFromCloud(currentUser.uid);
+                    await syncStorage.replayPendingWrites(currentUser.uid);
+                } catch (e) {
+                    console.error("Failed to sync on login", e);
+                }
+
+                // Persist searchable user info to Firestore for user search
+                try {
+                    await saveUserProfile(currentUser.uid, {
+                        displayName: currentUser.displayName || '',
+                        email: currentUser.email || '',
+                        searchName: (currentUser.displayName || '').toLowerCase(),
+                        creationTime: currentUser.metadata.creationTime || '',
+                    });
+                } catch (e) {
+                    console.error('Failed to persist user search info:', e);
+                }
+
+                // 1. Optimistically load from LocalStorage for instant UI (No "D" flash)
+                const storedAvatar = localStorage.getItem(`avatar_${currentUser.uid}`);
+                const storedBanner = localStorage.getItem(`banner_${currentUser.uid}`);
+                const storedProfileCardBackground = localStorage.getItem(`profile_card_bg_${currentUser.uid}`);
+                if (storedAvatar) {
+                    setAvatar(resolveStaticAssetUrl(storedAvatar));
+                }
+                if (storedBanner) {
+                    setBanner(resolveStaticAssetUrl(storedBanner));
+                }
+                if (storedProfileCardBackground) {
+                    setProfileCardBackground(resolveStaticAssetUrl(storedProfileCardBackground));
+                }
+
+                // 2. Fetch from Backend (Source of Truth - Firestore) and update if different
+                const profile = await fetchUserProfile(currentUser.uid);
+                const dbAvatar = profile.avatar;
+                const dbBanner = profile.banner;
+                const dbProfileCardBackground = profile.profileCardBackground;
+
+                if (dbAvatar) {
+                    if (dbAvatar !== storedAvatar) {
+                        const resolvedAvatar = resolveStaticAssetUrl(dbAvatar) || dbAvatar;
+                        setAvatar(resolvedAvatar);
+                        localStorage.setItem(`avatar_${currentUser.uid}`, resolvedAvatar);
+                    }
+                } else {
+                    // 3. If no DB avatar but we have local, sync local to DB
+                    if (storedAvatar) {
+                        saveUserProfile(currentUser.uid, { avatar: storedAvatar });
+                    } else {
+                        // 4. If neither, generate new random (deterministic based on UID)
+                        const newAvatar = getDeterministicAvatar(currentUser.uid);
+                        setAvatar(newAvatar);
+                        saveUserProfile(currentUser.uid, { avatar: newAvatar });
+                        localStorage.setItem(`avatar_${currentUser.uid}`, newAvatar);
+                    }
+                }
+
+                const defaultBanner = DEFAULT_BANNER_URL;
+                if (dbBanner) {
+                    if (dbBanner !== storedBanner) {
+                        const resolvedBanner = resolveStaticAssetUrl(dbBanner) || dbBanner;
+                        setBanner(resolvedBanner);
+                        localStorage.setItem(`banner_${currentUser.uid}`, resolvedBanner);
+                    }
+                } else if (storedBanner) {
+                    const resolvedStoredBanner = resolveStaticAssetUrl(storedBanner) || storedBanner;
+                    setBanner(resolvedStoredBanner);
+                    saveUserProfile(currentUser.uid, { banner: resolvedStoredBanner });
+                } else {
+                    setBanner(defaultBanner);
+                    saveUserProfile(currentUser.uid, { banner: defaultBanner });
+                    localStorage.setItem(`banner_${currentUser.uid}`, defaultBanner);
+                }
+
+                if (dbProfileCardBackground) {
+                    if (dbProfileCardBackground !== storedProfileCardBackground) {
+                        const resolvedBackground = resolveStaticAssetUrl(dbProfileCardBackground) || dbProfileCardBackground;
+                        setProfileCardBackground(resolvedBackground);
+                        localStorage.setItem(`profile_card_bg_${currentUser.uid}`, resolvedBackground);
+                    }
+                } else if (storedProfileCardBackground) {
+                    const resolvedStoredBackground = resolveStaticAssetUrl(storedProfileCardBackground) || storedProfileCardBackground;
+                    setProfileCardBackground(resolvedStoredBackground);
+                    saveUserProfile(currentUser.uid, { profileCardBackground: resolvedStoredBackground });
+                } else {
+                    setProfileCardBackground(null);
+                }
+            } else {
+                // Remove only legacy unscoped keys on sign-out.
+                clearLegacyUnscopedProgressStorage();
+                setAvatar(null);
+                setBanner(null);
+                setProfileCardBackground(null);
+            }
+
+            setIsLoading(false);
+        });
+
+        return () => unsubscribe();
+    }, []);
+
+    useEffect(() => {
+        if (!user?.uid) return;
+
+        const flushPendingWrites = () => {
+            void syncStorage.replayPendingWrites(user.uid);
+        };
+
+        const flushRootSync = () => {
+            void syncStorage.pushToCloud(user.uid);
+            void syncStorage.replayPendingWrites(user.uid);
+        };
+
+        window.addEventListener('online', flushPendingWrites);
+        window.addEventListener('visibilitychange', flushPendingWrites);
+        window.addEventListener('pagehide', flushRootSync);
+
+        return () => {
+            window.removeEventListener('online', flushPendingWrites);
+            window.removeEventListener('visibilitychange', flushPendingWrites);
+            window.removeEventListener('pagehide', flushRootSync);
+        };
+    }, [user?.uid]);
+
+    const login = async () => {
+        if (!auth || !googleProvider) return;
+        try {
+            await signInWithPopup(auth, googleProvider);
+        } catch (error) {
+            console.error("Login failed", error);
+        }
+    };
+
+    const logout = async () => {
+        if (!auth) return;
+        try {
+            await signOut(auth);
+            setAvatar(null);
+        } catch (error) {
+            console.error("Logout failed", error);
+        }
+    };
+
+    const updateName = async (name: string) => {
+        if (auth?.currentUser) {
+            try {
+                await updateProfile(auth.currentUser, { displayName: name });
+                setUser({ ...auth.currentUser, displayName: name });
+                // Keep Firestore searchable fields in sync
+                await saveUserProfile(auth.currentUser.uid, {
+                    displayName: name,
+                    searchName: name.toLowerCase(),
+                });
+            } catch (error) {
+                console.error("Failed to update name", error);
+                throw error;
+            }
+        }
+    };
+
+    const updateAvatar = async (newAvatarPath: string) => {
+        setAvatar(newAvatarPath);
+
+        if (auth?.currentUser) {
+            // Save to DB
+            await saveUserProfile(auth.currentUser.uid, { avatar: newAvatarPath });
+            // Keep legacy sync for now
+            localStorage.setItem(`avatar_${auth.currentUser.uid}`, newAvatarPath);
+        }
+    };
+
+    const updateBanner = async (newBannerPath: string) => {
+        setBanner(newBannerPath);
+
+        if (auth?.currentUser) {
+            await saveUserProfile(auth.currentUser.uid, { banner: newBannerPath });
+            localStorage.setItem(`banner_${auth.currentUser.uid}`, newBannerPath);
+        }
+    };
+
+    const updateProfileCardBackground = async (newBackgroundPath: string) => {
+        setProfileCardBackground(newBackgroundPath);
+
+        if (auth?.currentUser) {
+            await saveUserProfile(auth.currentUser.uid, { profileCardBackground: newBackgroundPath });
+            localStorage.setItem(`profile_card_bg_${auth.currentUser.uid}`, newBackgroundPath);
+        }
+    };
+
+    return (
+        <AuthContext.Provider value={{ user, avatar, banner, profileCardBackground, isLoading, login, logout, updateName, updateAvatar, updateBanner, updateProfileCardBackground }}>
+            {children}
+        </AuthContext.Provider>
+    );
+};
+
+export const useAuth = () => {
+    const context = useContext(AuthContext);
+    if (context === undefined) {
+        throw new Error('useAuth must be used within an AuthProvider');
+    }
+    return context;
+};
