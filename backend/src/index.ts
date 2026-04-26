@@ -1,61 +1,41 @@
 import 'dotenv/config';
 import app from './app';
 import { warmHomeFastCache } from './api/anilist/anilist.routes';
-// 🚫 DISABLED FOR CPANEL BUILD (uses scraper + puppeteer)
-// import { warmSpotlightCache } from './api/scraper/manga.service';
-// import { startScraperWarmer } from './api/scraper/scraper-warmer';
 import { warmupAnimeDatabase } from './api/logo/fanart.service';
 import { logger } from './core/logger';
 
-const port = process.env.PORT || 3001;
+const port = Number(process.env.PORT) || 3001;
 const shouldRunStandaloneServer = !process.env.VERCEL;
 
 if (shouldRunStandaloneServer) {
     const startServer = async () => {
         logger.info('Starting Yorumi backend server');
 
-        try {
-            logger.info('Warming anime homepage caches');
-            await Promise.race([
-                warmHomeFastCache(),
-                new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error('Cache warming timeout')), 10000)
-                )
-            ]);
-            logger.info('Homepage caches warmed successfully');
-        } catch (error) {
-            logger.warn('Homepage cache warming failed or timed out', error);
-        }
-
-        // 🚫 DISABLED (depends on scraper)
-        /*
-        try {
-            await warmSpotlightCache();
-            await warmupAnimeDatabase();
-        } catch (error) {
-            logger.warn('Secondary cache warming failed', error);
-        }
-        */
-
-        // ✅ Keep this (safe)
-        try {
-            await warmupAnimeDatabase();
-        } catch (error) {
-            logger.warn('Fanart cache warming failed', error);
-        }
-
-        app.listen(port, () => {
-            logger.info(`Server is running on http://localhost:${port}`);
+        // ✅ START SERVER IMMEDIATELY (IMPORTANT FOR RENDER)
+        app.listen(port, '0.0.0.0', () => {
+            logger.info(`Server running on port ${port}`);
         });
 
-        // 🚫 DISABLED (uses scraper loop)
-        // startScraperWarmer();
+        // 🚀 Run warmups in background (NON-BLOCKING)
+        setTimeout(async () => {
+            try {
+                logger.info('Warming homepage cache');
+                await warmHomeFastCache();
+            } catch (error) {
+                logger.warn('Homepage cache warming failed', error);
+            }
 
-        // Optional: keep scheduler safe
+            try {
+                logger.info('Warming fanart database');
+                await warmupAnimeDatabase();
+            } catch (error) {
+                logger.warn('Fanart warmup failed', error);
+            }
+        }, 2000);
+
+        // 🔁 Optional scheduler
         setInterval(() => {
-            logger.info('Running scheduled homepage cache refresh');
-            warmHomeFastCache()
-                .catch((error) => logger.error('Scheduled homepage cache refresh failed', error));
+            warmHomeFastCache().catch(() => {});
         }, 10 * 60 * 1000);
     };
 
